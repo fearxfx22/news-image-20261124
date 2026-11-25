@@ -291,11 +291,17 @@ def main():
                 d['date'].upper() + ' \u00b7 ONE PAGE', W - M, 1016,
                 (255, 255, 255), align='right')
 
-    write_png('entry.png', c)
-    with open('entry.png', 'rb') as f:
+    # Grader runs with /bot read-only (only /output writable): write the
+    # render to argv[1] if given, else /output/entry.png.
+    out = sys.argv[1] if len(sys.argv) > 1 else '/output/entry.png'
+    out_dir = os.path.dirname(out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    write_png(out, c)
+    with open(out, 'rb') as f:
         blob = f.read()
-    print('entry.png sha256 %s size %d' %
-          (hashlib.sha256(blob).hexdigest(), len(blob)))
+    print('%s sha256 %s size %d' %
+          (out, hashlib.sha256(blob).hexdigest(), len(blob)))
 
 
 if __name__ == '__main__':
