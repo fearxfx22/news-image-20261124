@@ -1,633 +1,605 @@
-#!/usr/bin/env python3
-"""Render the Tuesday 24 November 2026 front page (1024x1024 PNG).
+"""Pure-stdlib 2D canvas: TrueType text rasterizer, vector shapes, PNG writer.
 
-Reads stories.json next to this file and draws the paper: masthead, date,
-numbers strip, region bar, three illustrated features, ten illustrated
-medium cells, a world map with numbered dots, the ALSO list, a DATE CHECK
-box and the verification footer.
-
-Fonts: Liberation TrueType, bundled in ./fonts/ (falling back to the system
-Liberation install). Pillow is used when available; when it is not, main.py
-copies the pre-rendered entry.png instead, so both paths are byte-identical.
+No third-party imports: only struct, zlib, math, os, sys. Everything in this
+file was written fresh for the news-image v2 build.
 """
-
-import json
+import math
 import os
+import struct
 import sys
-
-from PIL import Image, ImageDraw, ImageFont
-
-W, H = 1024, 1024
-PAPER = (247, 242, 231)
-INK = (20, 20, 20)
-RED = (180, 30, 30)
-DARKRED = (140, 25, 25)
-NAVY = (31, 58, 95)
-DARKNAVY = (16, 36, 64)
-GRAY = (96, 92, 84)
-LINE = (178, 168, 148)
-OCEAN = (191, 217, 232)
-LAND = (232, 217, 168)
-WHITE = (255, 255, 255)
-CREAMBOX = (255, 252, 244)
-
-TAG_FILL = {
-    "CONFIRMED": (34, 120, 60),
-    "OFFICIAL": (31, 58, 95),
-    "REPORTED": (176, 120, 0),
-    "CLAIM": (180, 30, 30),
-}
-
-REGION_FILL = {
-    "AMERICAS": (31, 58, 95),
-    "EUROPE": (46, 110, 142),
-    "ASIA": (172, 124, 12),
-    "MIDDLE EAST": (180, 30, 30),
-    "AFRICA": (107, 79, 161),
-    "OCEANIA": (46, 125, 91),
-    "GLOBAL": (90, 90, 90),
-}
-
-SERIF_B = "LiberationSerif-Bold.ttf"
-SERIF = "LiberationSerif-Regular.ttf"
-SERIF_I = "LiberationSerif-Italic.ttf"
-SANS_B = "LiberationSans-Bold.ttf"
-SANS = "LiberationSans-Regular.ttf"
-SANS_I = "LiberationSans-Italic.ttf"
+import zlib
 
 
-def _font(name, size):
-    here = os.path.dirname(os.path.abspath(__file__))
-    for base in (os.path.join(here, "fonts"),
-                 "/usr/share/fonts/truetype/liberation"):
-        path = os.path.join(base, name)
-        if os.path.exists(path):
-            return ImageFont.truetype(path, size)
-    return ImageFont.load_default()
+# --------------------------------------------------------------------------
+# TrueType font parsing (cmap fmt 4, glyf simple + composite, hmtx)
+# --------------------------------------------------------------------------
+
+def _u16(b, o):
+    return struct.unpack_from('>H', b, o)[0]
 
 
-def wrap(d, text, font, max_w):
-    """Word-wrap text to a list of lines fitting max_w pixels."""
-    words = text.split()
-    lines, cur = [], ""
-    for w in words:
-        trial = (cur + " " + w).strip()
-        if d.textlength(trial, font=font) <= max_w or not cur:
-            cur = trial
+def _i16(b, o):
+    return struct.unpack_from('>h', b, o)[0]
+
+
+def _u32(b, o):
+    return struct.unpack_from('>I', b, o)[0]
+
+
+class Font:
+    def __init__(self, path):
+        self.path = path
+        data = open(path, 'rb').read()
+        self.data = data
+        n_tables = _u16(data, 4)
+        self.tables = {}
+        for i in range(n_tables):
+            off = 12 + i * 16
+            tag = data[off:off + 4].decode('latin-1')
+            self.tables[tag] = (_u32(data, off + 8), _u32(data, off + 12))
+        head_off, _ = self.tables['head']
+        self.upem = _u16(data, head_off + 18)
+        self.loc_fmt = _i16(data, head_off + 50)
+        maxp_off, _ = self.tables['maxp']
+        self.num_glyphs = _u16(data, maxp_off + 4)
+        hhea_off, _ = self.tables['hhea']
+        self.ascender = _i16(data, hhea_off + 4)
+        self.descender = _i16(data, hhea_off + 6)
+        self.num_hmetrics = _u16(data, hhea_off + 34)
+        self._cmap = self._parse_cmap()
+        self._glyph_cache = {}
+
+    def _table(self, tag):
+        off, ln = self.tables[tag]
+        return self.data[off:off + ln]
+
+    def _parse_cmap(self):
+        data = self._table('cmap')
+        n = _u16(data, 2)
+        best = None
+        for i in range(n):
+            plat = _u16(data, 4 + i * 8)
+            enc = _u16(data, 6 + i * 8)
+            off = _u32(data, 8 + i * 8)
+            fmt = _u16(data, off)
+            if fmt == 4 and plat == 3:
+                return ('fmt4', off)
+            if fmt == 4 and best is None:
+                best = ('fmt4', off)
+            if fmt == 12 and best is None:
+                best = ('fmt12', off)
+        return best
+
+    def glyph_index(self, ch):
+        kind, off = self._cmap
+        data = self._table('cmap')
+        if kind == 'fmt4':
+            seg_count = _u16(data, off + 6) // 2
+            end_off = off + 14
+            start_off = end_off + 2 * seg_count + 2
+            delta_off = start_off + 2 * seg_count
+            range_off = delta_off + 2 * seg_count
+            for i in range(seg_count):
+                end = _u16(data, end_off + 2 * i)
+                if ch > end:
+                    continue
+                start = _u16(data, start_off + 2 * i)
+                if ch < start:
+                    return 0
+                delta = _i16(data, delta_off + 2 * i)
+                ro = _u16(data, range_off + 2 * i)
+                if ro == 0:
+                    return (ch + delta) & 0xFFFF
+                addr = range_off + 2 * i + ro + 2 * (ch - start)
+                g = _u16(data, addr)
+                if g == 0:
+                    return 0
+                return (g + delta) & 0xFFFF
+            return 0
+        # format 12
+        n_groups = _u32(data, off + 12)
+        for i in range(n_groups):
+            go = off + 16 + i * 12
+            start = _u32(data, go)
+            end = _u32(data, go + 4)
+            base = _u32(data, go + 8)
+            if start <= ch <= end:
+                return base + (ch - start)
+        return 0
+
+    def _glyph_offset(self, gid):
+        loca = self._table('loca')
+        if self.loc_fmt == 0:
+            o1 = _u16(loca, gid * 2) * 2
+            o2 = _u16(loca, gid * 2 + 2) * 2
         else:
+            o1 = _u32(loca, gid * 4)
+            o2 = _u32(loca, gid * 4 + 4)
+        return o1, o2
+
+    def advance(self, gid):
+        hmtx = self._table('hmtx')
+        if gid < self.num_hmetrics:
+            return _u16(hmtx, gid * 4)
+        return _u16(hmtx, (self.num_hmetrics - 1) * 4)
+
+    def outline(self, gid):
+        """Return list of contours; each contour is a list of (x, y, on_curve)."""
+        if gid in self._glyph_cache:
+            return self._glyph_cache[gid]
+        glyf = self._table('glyf')
+        o1, o2 = self._glyph_offset(gid)
+        if o2 <= o1:
+            self._glyph_cache[gid] = []
+            return []
+        n_contours = _i16(glyf, o1)
+        if n_contours >= 0:
+            contours = self._simple_outline(glyf, o1, n_contours)
+        else:
+            contours = self._composite_outline(glyf, o1)
+        self._glyph_cache[gid] = contours
+        return contours
+
+    def _simple_outline(self, glyf, o, n_contours):
+        end_pts = [_u16(glyf, o + 10 + 2 * i) for i in range(n_contours)]
+        n_points = end_pts[-1] + 1 if end_pts else 0
+        instr_len = _u16(glyf, o + 10 + 2 * n_contours)
+        p = o + 10 + 2 * n_contours + 2 + instr_len
+        flags = []
+        while len(flags) < n_points:
+            f = glyf[p]
+            p += 1
+            flags.append(f)
+            if f & 0x08:
+                rep = glyf[p]
+                p += 1
+                flags.extend([f] * rep)
+        xs = []
+        x = 0
+        for f in flags:
+            if f & 0x02:
+                d = glyf[p]
+                p += 1
+                x += d if (f & 0x10) else -d
+            elif f & 0x10:
+                pass
+            else:
+                x += _i16(glyf, p)
+                p += 2
+            xs.append(x)
+        ys = []
+        y = 0
+        for f in flags:
+            if f & 0x04:
+                d = glyf[p]
+                p += 1
+                y += d if (f & 0x20) else -d
+            elif f & 0x20:
+                pass
+            else:
+                y += _i16(glyf, p)
+                p += 2
+            ys.append(y)
+        contours = []
+        start = 0
+        for end in end_pts:
+            pts = [(xs[i], ys[i], bool(flags[i] & 0x01))
+                   for i in range(start, end + 1)]
+            contours.append(pts)
+            start = end + 1
+        return contours
+
+    def _composite_outline(self, glyf, o):
+        p = o + 10
+        contours = []
+        while True:
+            flags = _u16(glyf, p)
+            comp_gid = _u16(glyf, p + 2)
+            p += 4
+            if flags & 0x0001:
+                dx = _i16(glyf, p)
+                dy = _i16(glyf, p + 2)
+                p += 4
+            else:
+                dx = glyf[p] if not (flags & 0x0002) else 0
+                dy = glyf[p + 1] if not (flags & 0x0002) else 0
+                # ARGS_ARE_XY_VALUES with bytes: signed bytes
+                if flags & 0x0002:
+                    dx = glyf[p] - 256 if glyf[p] > 127 else glyf[p]
+                    dy = glyf[p + 1] - 256 if glyf[p + 1] > 127 else glyf[p + 1]
+                p += 2
+            a = d = 1.0
+            b = c = 0.0
+            if flags & 0x0008:
+                s = _i16(glyf, p) / 16384.0
+                p += 2
+                a = d = s
+            elif flags & 0x0040:
+                a = _i16(glyf, p) / 16384.0
+                d = _i16(glyf, p + 2) / 16384.0
+                p += 4
+            elif flags & 0x0080:
+                a = _i16(glyf, p) / 16384.0
+                b = _i16(glyf, p + 2) / 16384.0
+                c = _i16(glyf, p + 4) / 16384.0
+                d = _i16(glyf, p + 6) / 16384.0
+                p += 8
+            for contour in self.outline(comp_gid):
+                out = []
+                for (x, y, on) in contour:
+                    nx = a * x + b * y + dx
+                    ny = c * x + d * y + dy
+                    out.append((nx, ny, on))
+                contours.append(out)
+            if not (flags & 0x0020):
+                break
+        return contours
+
+
+# --------------------------------------------------------------------------
+# Outline flattening + scanline fill
+# --------------------------------------------------------------------------
+
+def _flatten_contour(pts):
+    """Walk a TrueType contour into a polyline of (x, y) points."""
+    if not pts:
+        return []
+    n = len(pts)
+    # expand: insert implied on-curve midpoints between consecutive
+    # off-curve points (including wraparound)
+    exp = []
+    for i in range(n):
+        p = pts[i]
+        q = pts[(i + 1) % n]
+        exp.append(p)
+        if not p[2] and not q[2]:
+            exp.append(((p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0, True))
+    si = None
+    for i, p in enumerate(exp):
+        if p[2]:
+            si = i
+            break
+    if si is None:
+        return []
+    rot = exp[si:] + exp[:si]
+    poly = [rot[0][:2]]
+    cur = rot[0][:2]
+    i = 1
+    m = len(rot)
+    while i < m:
+        p = rot[i]
+        if p[2]:
+            poly.append(p[:2])
+            cur = p[:2]
+            i += 1
+        else:
+            end = rot[(i + 1) % m][:2]
+            cx, cy = p[0], p[1]
+            x0, y0 = cur
+            x1, y1 = end
+            chord = math.hypot(x1 - x0, y1 - y0) + math.hypot(cx - x0, cy - y0)
+            segs = max(2, min(24, int(chord / 90.0) + 2))
+            for s in range(1, segs + 1):
+                t = s / float(segs)
+                mt = 1 - t
+                poly.append((mt * mt * x0 + 2 * mt * t * cx + t * t * x1,
+                             mt * mt * y0 + 2 * mt * t * cy + t * t * y1))
+            cur = end
+            i += 2
+    return poly
+
+
+def _fill_polys(mask, mw, mh, polys):
+    """Even-odd scanline fill of polygons into a byte mask (0/255)."""
+    edges = []
+    for poly in polys:
+        if len(poly) < 3:
+            continue
+        for i in range(len(poly)):
+            x1, y1 = poly[i]
+            x2, y2 = poly[(i + 1) % len(poly)]
+            if y1 == y2:
+                continue
+            edges.append((x1, y1, x2, y2))
+    if not edges:
+        return
+    ys = [e[1] for e in edges] + [e[3] for e in edges]
+    y0 = max(0, int(math.floor(min(ys))))
+    y1 = min(mh, int(math.ceil(max(ys))))
+    for y in range(y0, y1):
+        yc = y + 0.5
+        xs = []
+        for (x1, y1e, x2, y2e) in edges:
+            if (y1e <= yc < y2e) or (y2e <= yc < y1e):
+                xs.append(x1 + (yc - y1e) * (x2 - x1) / (y2e - y1e))
+        if len(xs) < 2:
+            continue
+        xs.sort()
+        row = y * mw
+        for k in range(0, len(xs) - 1, 2):
+            xa = int(math.ceil(xs[k] - 0.5))
+            xb = int(math.floor(xs[k + 1] - 0.5))
+            if xb < 0 or xa >= mw:
+                continue
+            xa = max(0, xa)
+            xb = min(mw - 1, xb)
+            for xx in range(xa, xb + 1):
+                mask[row + xx] = 255
+
+
+# --------------------------------------------------------------------------
+# Canvas
+# --------------------------------------------------------------------------
+
+SS = 2  # glyph supersampling factor
+
+
+class Canvas:
+    def __init__(self, w, h, bg):
+        self.w = w
+        self.h = h
+        self.px = bytearray(w * h * 3)
+        self.fill_rect(0, 0, w, h, bg)
+        self._fonts = {}
+        self._glyph_masks = {}
+
+    # -- low level ------------------------------------------------------
+    def _set(self, x, y, color):
+        if 0 <= x < self.w and 0 <= y < self.h:
+            i = (y * self.w + x) * 3
+            self.px[i] = color[0]
+            self.px[i + 1] = color[1]
+            self.px[i + 2] = color[2]
+
+    def fill_rect(self, x, y, w, h, color):
+        x0 = max(0, int(x))
+        y0 = max(0, int(y))
+        x1 = min(self.w, int(x + w))
+        y1 = min(self.h, int(y + h))
+        if x1 <= x0 or y1 <= y0:
+            return
+        r, g, b = color
+        row_bytes = bytes((r, g, b)) * (x1 - x0)
+        for yy in range(y0, y1):
+            base = (yy * self.w + x0) * 3
+            self.px[base:base + (x1 - x0) * 3] = row_bytes
+
+    def hline(self, x, y, w, color, thick=1):
+        self.fill_rect(x, y, w, thick, color)
+
+    def vline(self, x, y, h, color, thick=1):
+        self.fill_rect(x, y, thick, h, color)
+
+    def rect(self, x, y, w, h, color, thick=1):
+        self.hline(x, y, w, color, thick)
+        self.hline(x, y + h - thick, w, color, thick)
+        self.vline(x, y, h, color, thick)
+        self.vline(x + w - thick, y, h, color, thick)
+
+    def circle(self, cx, cy, r, color):
+        r = int(r)
+        for dy in range(-r, r + 1):
+            dx = int(math.sqrt(max(0, r * r - dy * dy)))
+            self.fill_rect(cx - dx, cy + dy, 2 * dx + 1, 1, color)
+
+    def ellipse(self, cx, cy, rx, ry, color):
+        for dy in range(-int(ry), int(ry) + 1):
+            t = 1 - (dy * dy) / float(ry * ry)
+            if t < 0:
+                continue
+            dx = int(rx * math.sqrt(t))
+            self.fill_rect(cx - dx, cy + dy, 2 * dx + 1, 1, color)
+
+    def polygon(self, pts, color):
+        if len(pts) < 3:
+            return
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        bx0 = max(0, int(math.floor(min(xs))))
+        by0 = max(0, int(math.floor(min(ys))))
+        bx1 = min(self.w, int(math.ceil(max(xs))) + 1)
+        by1 = min(self.h, int(math.ceil(max(ys))) + 1)
+        if bx1 <= bx0 or by1 <= by0:
+            return
+        mw = bx1 - bx0
+        mh = by1 - by0
+        shifted = [[(x - bx0, y - by0) for (x, y) in pts]]
+        mask = bytearray(mw * mh)
+        _fill_polys(mask, mw, mh, shifted)
+        r, g, b = color
+        for yy in range(by0, by1):
+            mrow = (yy - by0) * mw
+            prow = (yy * self.w + bx0) * 3
+            for xx in range(mw):
+                if mask[mrow + xx]:
+                    i = prow + xx * 3
+                    self.px[i] = r
+                    self.px[i + 1] = g
+                    self.px[i + 2] = b
+
+    def rrect(self, x, y, w, h, r, color):
+        x, y, w, h, r = int(x), int(y), int(w), int(h), int(r)
+        r = min(r, w // 2, h // 2)
+        for yy in range(y, y + h):
+            if yy < y + r:
+                t = yy - y
+                inset = r - int(math.sqrt(max(0, r * r - (r - t) * (r - t))))
+            elif yy >= y + h - r:
+                t = (y + h - 1) - yy
+                inset = r - int(math.sqrt(max(0, r * r - (r - t) * (r - t))))
+            else:
+                inset = 0
+            self.fill_rect(x + inset, yy, w - 2 * inset, 1, color)
+
+    def gradient_rect(self, x, y, w, h, top, bottom):
+        for yy in range(int(y), int(y + h)):
+            t = (yy - y) / float(max(1, h - 1))
+            c = tuple(int(top[i] + (bottom[i] - top[i]) * t) for i in range(3))
+            self.fill_rect(x, yy, w, 1, c)
+
+    def polyline(self, pts, color, width=2):
+        if len(pts) < 2:
+            return
+        hw = width / 2.0
+        for i in range(len(pts) - 1):
+            x1, y1 = pts[i]
+            x2, y2 = pts[i + 1]
+            dx, dy = x2 - x1, y2 - y1
+            ln = math.hypot(dx, dy)
+            if ln == 0:
+                continue
+            nx, ny = -dy / ln * hw, dx / ln * hw
+            self.polygon([(x1 + nx, y1 + ny), (x2 + nx, y2 + ny),
+                          (x2 - nx, y2 - ny), (x1 - nx, y1 - ny)], color)
+            self.circle(int(round(x1)), int(round(y1)), int(math.ceil(hw)), color)
+        self.circle(int(round(pts[-1][0])), int(round(pts[-1][1])),
+                    int(math.ceil(hw)), color)
+
+    # -- fonts ----------------------------------------------------------
+    def font(self, path):
+        if path not in self._fonts:
+            self._fonts[path] = Font(path)
+        return self._fonts[path]
+
+    def _glyph_mask(self, font, ch, size):
+        key = (font.path, ch, size)
+        if key in self._glyph_masks:
+            return self._glyph_masks[key]
+        gid = font.glyph_index(ord(ch))
+        scale = size * SS / float(font.upem)
+        adv = font.advance(gid) * size / float(font.upem)
+        if gid == 0:
+            res = (None, 0, 0, 0, 0, adv)
+            self._glyph_masks[key] = res
+            return res
+        contours = font.outline(gid)
+        polys = []
+        minx = miny = None
+        maxx = maxy = None
+        for contour in contours:
+            poly = _flatten_contour(contour)
+            if not poly:
+                continue
+            # flip y (TTF y up -> screen y down), scale by SS
+            sp = [(x * scale, -y * scale) for (x, y) in poly]
+            polys.append(sp)
+            for (px, py) in sp:
+                minx = px if minx is None else min(minx, px)
+                maxx = px if maxx is None else max(maxx, px)
+                miny = py if miny is None else min(miny, py)
+                maxy = py if maxy is None else max(maxy, py)
+        if not polys:
+            res = (None, 0, 0, 0, 0, adv)
+            self._glyph_masks[key] = res
+            return res
+        ox = int(math.floor(minx))
+        oy = int(math.floor(miny))
+        mw = int(math.ceil(maxx)) - ox + 1
+        mh = int(math.ceil(maxy)) - oy + 1
+        shifted = [[(x - ox, y - oy) for (x, y) in poly] for poly in polys]
+        mask = bytearray(mw * mh)
+        _fill_polys(mask, mw, mh, shifted)
+        # downsample SS x SS -> grayscale 1x mask
+        gw = (mw + SS - 1) // SS
+        gh = (mh + SS - 1) // SS
+        gray = bytearray(gw * gh)
+        for gy in range(gh):
+            for gx in range(gw):
+                s = 0
+                n = 0
+                for dy in range(SS):
+                    for dx in range(SS):
+                        sx = gx * SS + dx
+                        sy = gy * SS + dy
+                        if sx < mw and sy < mh:
+                            s += mask[sy * mw + sx]
+                            n += 1
+                gray[gy * gw + gx] = (s * 255) // (255 * n) if n else 0
+        res = (gray, gw, gh, ox / float(SS), oy / float(SS), adv)
+        self._glyph_masks[key] = res
+        return res
+
+    def text_width(self, font, size, text):
+        w = 0.0
+        for ch in text:
+            gid = font.glyph_index(ord(ch))
+            w += font.advance(gid) * size / float(font.upem)
+        return w
+
+    def draw_text(self, font, size, text, x, y, color, align='left'):
+        """Draw text with baseline at y. align: left/center/right on x."""
+        if align == 'center':
+            x -= self.text_width(font, size, text) / 2.0
+        elif align == 'right':
+            x -= self.text_width(font, size, text)
+        pen = x
+        for ch in text:
+            gray, gw, gh, ox, oy, adv = self._glyph_mask(font, ch, size)
+            if gray is not None:
+                gx0 = int(round(pen + ox))
+                gy0 = int(round(y + oy))
+                for gy in range(gh):
+                    dy = gy0 + gy
+                    if dy < 0 or dy >= self.h:
+                        continue
+                    row = dy * self.w
+                    for gx in range(gw):
+                        a = gray[gy * gw + gx]
+                        if a == 0:
+                            continue
+                        dx = gx0 + gx
+                        if dx < 0 or dx >= self.w:
+                            continue
+                        i = (row + dx) * 3
+                        if a == 255:
+                            self.px[i] = color[0]
+                            self.px[i + 1] = color[1]
+                            self.px[i + 2] = color[2]
+                        else:
+                            self.px[i] = (self.px[i] * (255 - a) + color[0] * a) // 255
+                            self.px[i + 1] = (self.px[i + 1] * (255 - a) + color[1] * a) // 255
+                            self.px[i + 2] = (self.px[i + 2] * (255 - a) + color[2] * a) // 255
+            pen += adv
+        return pen
+
+    def wrap(self, font, size, text, max_w):
+        """Greedy word wrap; returns list of lines."""
+        words = text.split(' ')
+        lines = []
+        cur = ''
+        for wd in words:
+            trial = (cur + ' ' + wd).strip()
+            if self.text_width(font, size, trial) <= max_w or not cur:
+                cur = trial
+            else:
+                lines.append(cur)
+                cur = wd
+        if cur:
             lines.append(cur)
-            cur = w
-    if cur:
-        lines.append(cur)
-    return lines
+        return lines
 
 
-def fit_lines(d, text, font_name, start_size, min_size, max_w, max_lines):
-    """Largest font size (from start_size down) fitting max_lines lines."""
-    size = start_size
-    while size >= min_size:
-        font = _font(font_name, size)
-        lines = wrap(d, text, font, max_w)
-        if len(lines) <= max_lines:
-            return font, lines
-        size -= 1
-    font = _font(font_name, min_size)
-    return font, wrap(d, text, font, max_w)[:max_lines]
+# --------------------------------------------------------------------------
+# PNG writer (deterministic: fixed filters, fixed zlib level)
+# --------------------------------------------------------------------------
+
+def _chunk(typ, payload):
+    c = struct.pack('>I', len(payload)) + typ + payload
+    c += struct.pack('>I', zlib.crc32(typ + payload) & 0xFFFFFFFF)
+    return c
 
 
-def tag_pill(d, x, y, tag):
-    """Right-aligned verification tag pill; returns its left edge."""
-    font = _font(SANS_B, 9)
-    tw = d.textlength(tag, font=font)
-    w = int(tw) + 12
-    d.rounded_rectangle([x - w, y, x, y + 13], radius=3,
-                        fill=TAG_FILL.get(tag, GRAY))
-    d.text((x - w + 6, y + 2), tag, font=font, fill=WHITE)
-    return x - w
-
-
-# ---------------------------------------------------------------- illustrations
-
-def art_chip(d, x, y, w, h):
-    d.rectangle([x, y, x + w, y + h], fill=DARKNAVY)
-    cx0, cy0 = x + 16, y + 16
-    cx1, cy1 = x + 126, y + h - 16
-    d.rectangle([cx0, cy0, cx1, cy1], fill=(200, 206, 214),
-                outline=(120, 128, 138), width=2)
-    d.rectangle([cx0 + 14, cy0 + 10, cx1 - 14, cy1 - 10], fill=(90, 96, 106))
-    for i in range(4):
-        px = cx0 + 18 + i * 26
-        d.line([px, cy0 - 8, px, cy0], fill=(200, 206, 214), width=3)
-        d.line([px, cy1, px, cy1 + 8], fill=(200, 206, 214), width=3)
-    for j in range(3):
-        py = cy0 + 12 + j * 12
-        d.line([cx0 - 8, py, cx0, py], fill=(200, 206, 214), width=3)
-        d.line([cx1, py, cx1 + 8, py], fill=(200, 206, 214), width=3)
-    pts = [(x + 150, y + h - 14), (x + 182, y + h - 32),
-           (x + 212, y + h - 24), (x + 252, y + 18), (x + 300, y + 10)]
-    d.line(pts, fill=(74, 222, 128), width=4)
-    d.polygon([(x + 300, y + 10), (x + 290, y + 8), (x + 296, y + 20)],
-              fill=(74, 222, 128))
-
-
-def art_ship(d, x, y, w, h):
-    d.rectangle([x, y, x + w, y + h], fill=(217, 232, 240))
-    d.rectangle([x, y + int(h * 0.55), x + w, y + h], fill=(46, 110, 142))
-    d.polygon([(x + 12, y + h - 12), (x + w - 12, y + h - 12),
-               (x + w - 26, y + h - 32), (x + 26, y + h - 32)],
-              fill=(60, 60, 66))
-    d.rectangle([x + 30, y + h - 50, x + 62, y + h - 32], fill=(180, 30, 30))
-    d.rectangle([x + 66, y + h - 50, x + 96, y + h - 32], fill=(232, 180, 40))
-    for dx, dy in ((18, 10), (44, 4), (70, 12)):
-        d.ellipse([x + w - dx - 22, y + dy, x + w - dx - 14, y + dy + 8],
-                  fill=(40, 40, 44))
-        d.line([x + w - dx - 18, y + dy + 8, x + w - dx - 18, y + dy + 22],
-               fill=(40, 40, 44), width=1)
-    d.line([x + 8, y + h - 8, x + w - 8, y + h - 8], fill=WHITE, width=2)
-
-
-def art_skyline(d, x, y, w, h):
-    d.rectangle([x, y, x + w, y + h], fill=(58, 46, 79))
-    d.ellipse([x + w - 52, y + 8, x + w - 16, y + 44], fill=(232, 180, 90))
-    for bx, bw, bh in ((6, 22, 46), (32, 18, 62), (54, 24, 38),
-                       (82, 18, 56), (104, 22, 44)):
-        d.rectangle([x + bx, y + h - bh, x + bx + bw, y + h], fill=(24, 20, 32))
-        for wy in range(y + h - bh + 6, y + h - 6, 10):
-            for wx in range(x + bx + 4, x + bx + bw - 4, 8):
-                d.rectangle([wx, wy, wx + 3, wy + 4], fill=(255, 214, 90))
-    for cx, cy, r in ((58, 18, 9), (70, 10, 12), (84, 20, 8)):
-        d.ellipse([x + cx - r, y + cy - r, x + cx + r, y + cy + r],
-                  fill=(150, 150, 158))
-
-
-def art_blast(d, x, y, w, h):
-    d.rectangle([x, y, x + w, y + h], fill=(216, 210, 196))
-    d.rectangle([x + 12, y + 10, x + w - 12, y + h - 4], fill=(196, 178, 140))
-    for row in range(2):
-        for col in range(4):
-            d.rectangle([x + 18 + col * 14, y + 15 + row * 9,
-                         x + 26 + col * 14, y + 21 + row * 9],
-                        fill=(60, 52, 40))
-    import math
-    cx, cy = x + w // 2, y + 15
-    for k in range(8):
-        ang = k * 3.14159 / 4
-        x1 = cx + int(6 * math.cos(ang))
-        y1 = cy + int(6 * math.sin(ang))
-        x2 = cx + int(12 * math.cos(ang))
-        y2 = cy + int(12 * math.sin(ang))
-        d.line([x1, y1, x2, y2], fill=(232, 110, 20), width=3)
-    d.ellipse([cx - 5, cy - 5, cx + 5, cy + 5], fill=(255, 200, 60))
-
-
-def art_tanker(d, x, y, w, h):
-    d.rectangle([x, y, x + w, y + h], fill=(46, 110, 142))
-    d.polygon([(x + 8, y + h - 8), (x + w - 8, y + h - 8),
-               (x + w - 20, y + h - 20), (x + 20, y + h - 20)],
-              fill=(120, 40, 36))
-    d.rectangle([x + 26, y + 4, x + 52, y + h - 20], fill=(232, 232, 232))
-    cx, cy = x + w - 26, y + 11
-    for k in range(8):
-        import math
-        ang = k * 3.14159 / 4
-        d.line([cx + int(6 * math.cos(ang)), cy + int(6 * math.sin(ang)),
-                cx + int(11 * math.cos(ang)), cy + int(11 * math.sin(ang))],
-               fill=(20, 20, 24), width=2)
-    d.ellipse([cx - 7, cy - 7, cx + 7, cy + 7], fill=(20, 20, 24))
-    d.line([x + 8, y + h - 4, x + w - 8, y + h - 4], fill=WHITE, width=2)
-
-
-def art_satellite(d, x, y, w, h):
-    d.rectangle([x, y, x + w, y + h], fill=(15, 30, 51))
-    d.ellipse([x - 30, y + h - 20, x + 44, y + h], fill=(210, 180, 120))
-    d.ellipse([x + 20, y + 8, x + w - 20, y + h - 8], outline=(150, 180, 210),
-              width=2)
-    sx, sy = x + w - 34, y + 14
-    d.rectangle([sx - 12, sy - 3, sx - 4, sy + 3], fill=(90, 140, 200))
-    d.rectangle([sx + 4, sy - 3, sx + 12, sy + 3], fill=(90, 140, 200))
-    d.rectangle([sx - 4, sy - 5, sx + 4, sy + 5], fill=(232, 232, 232))
-    d.ellipse([sx - 2, sy - 9, sx + 2, sy - 5], fill=(232, 232, 232))
-    for px, py in ((18, 26), (34, 12), (52, 30)):
-        d.ellipse([x + px, y + py, x + px + 2, y + py + 2], fill=WHITE)
-
-
-def art_rocket(d, x, y, w, h):
-    d.rectangle([x, y, x + w, y + h], fill=(191, 217, 232))
-    d.ellipse([x + w - 40, y + 2, x + w - 14, y + 22], fill=(255, 220, 120))
-    cx = x + w // 2 - 6
-    d.polygon([(cx + 6, y + 2), (cx, y + 12), (cx + 12, y + 12)],
-              fill=(180, 30, 30))
-    d.rectangle([cx, y + 12, cx + 12, y + h - 12], fill=(232, 232, 232),
-                outline=(120, 120, 120), width=1)
-    d.polygon([(cx, y + h - 12), (cx - 6, y + h - 4), (cx + 2, y + h - 12)],
-              fill=(180, 30, 30))
-    d.polygon([(cx + 12, y + h - 12), (cx + 18, y + h - 4),
-               (cx + 10, y + h - 12)], fill=(180, 30, 30))
-    d.polygon([(cx + 2, y + h - 12), (cx + 10, y + h - 12),
-               (cx + 6, y + h - 2)], fill=(255, 160, 40))
-    d.ellipse([x + 8, y + h - 14, x + 30, y + h - 4], outline=(90, 90, 90),
-              width=2)
-
-
-def art_bars(d, x, y, w, h):
-    d.rectangle([x, y, x + w, y + h], fill=WHITE)
-    vals = [("US", 78.9, NAVY), ("CN", 73.6, RED), ("IN", 40.5, (46, 125, 91))]
-    base = y + h - 10
-    top = y + 10
-    bw = 34
-    for i, (lab, v, col) in enumerate(vals):
-        bh = max(3, int((v / 80.0) * (base - top)))
-        bx = x + 14 + i * 48
-        f = _font(SANS_B, 8)
-        d.text((bx + 2, y + 1), str(v), font=f, fill=INK)
-        d.rectangle([bx, base - bh, bx + bw, base], fill=col)
-        f2 = _font(SANS_B, 9)
-        d.text((bx + 8, base + 1), lab, font=f2, fill=INK)
-
-
-def art_mountains(d, x, y, w, h):
-    d.rectangle([x, y, x + w, y + h], fill=(217, 232, 240))
-    d.ellipse([x + w - 34, y + 4, x + w - 14, y + 24], fill=(255, 220, 120))
-    d.polygon([(x + 4, y + h), (x + 34, y + 10), (x + 64, y + h)],
-              fill=(110, 130, 110))
-    d.polygon([(x + 28, y + 18), (x + 34, y + 10), (x + 40, y + 18)],
-              fill=WHITE)
-    d.polygon([(x + 40, y + h), (x + 74, y + 22), (x + 108, y + h)],
-              fill=(80, 105, 85))
-    d.polygon([(x + 68, y + 29), (x + 74, y + 22), (x + 80, y + 29)],
-              fill=WHITE)
-    d.line([x + w - 18, y + h - 26, x + w - 18, y + h - 6], fill=INK, width=2)
-    d.polygon([(x + w - 18, y + h - 26), (x + w - 6, y + h - 22),
-               (x + w - 18, y + h - 18)], fill=(180, 30, 30))
-
-
-def art_factory(d, x, y, w, h):
-    d.rectangle([x, y, x + w, y + h], fill=(232, 220, 200))
-    d.rectangle([x + 10, y + 20, x + w - 10, y + h - 6], fill=(150, 140, 120))
-    for i in range(4):
-        bx = x + 14 + i * 22
-        d.polygon([(bx, y + 20), (bx + 11, y + 10), (bx + 22, y + 20)],
-                  fill=(120, 110, 92))
-    d.rectangle([x + 16, y + h - 22, x + 30, y + h - 6], fill=(60, 52, 40))
-    cx, cy = x + w - 26, y + 16
-    d.polygon([(cx - 10, cy + 12), (cx - 2, cy - 8), (cx + 4, cy + 2),
-               (cx + 10, cy - 10), (cx + 12, cy + 12)], fill=(255, 140, 20))
-    d.polygon([(cx - 5, cy + 12), (cx, cy + 2), (cx + 6, cy + 12)],
-              fill=(255, 210, 60))
-    for sx, sy, r in ((x + 30, y + 8, 6), (x + 44, y + 4, 8)):
-        d.ellipse([sx - r, sy - r, sx + r, sy + r], fill=(170, 170, 178))
-
-
-def art_scales(d, x, y, w, h):
-    d.rectangle([x, y, x + w, y + h], fill=(239, 231, 211))
-    cx = x + w // 2
-    d.line([cx, y + 8, cx, y + h - 8], fill=(90, 70, 40), width=3)
-    d.line([cx - 26, y + 14, cx + 26, y + 14], fill=(90, 70, 40), width=3)
-    d.ellipse([cx - 4, y + 4, cx + 4, y + 12], fill=(180, 150, 60))
-    for sgn in (-1, 1):
-        px = cx + sgn * 26
-        d.line([px, y + 14, px - 7, y + 26], fill=(90, 70, 40), width=2)
-        d.line([px, y + 14, px + 7, y + 26], fill=(90, 70, 40), width=2)
-        d.pieslice([px - 9, y + 24, px + 9, y + 32], 0, 180,
-                   fill=(180, 150, 60))
-    d.rectangle([cx - 12, y + h - 6, cx + 12, y + h - 2], fill=(90, 70, 40))
-
-
-def art_columns(d, x, y, w, h):
-    d.rectangle([x, y, x + w, y + h], fill=(232, 226, 210))
-    d.polygon([(x + 8, y + 12), (x + w // 2, y + 2), (x + w - 8, y + 12)],
-              fill=(120, 100, 70))
-    for i in range(3):
-        bx = x + 16 + i * 34
-        d.rectangle([bx, y + 16, bx + 12, y + h - 12], fill=(200, 188, 160),
-                    outline=(120, 100, 70), width=1)
-        d.rectangle([bx - 2, y + 14, bx + 14, y + 17], fill=(120, 100, 70))
-    d.rectangle([x + 8, y + h - 10, x + w - 8, y + h - 6], fill=(120, 100, 70))
-
-
-def art_cricket(d, x, y, w, h):
-    d.rectangle([x, y, x + w, y + h], fill=(62, 125, 78))
-    d.rectangle([x + w // 2 - 12, y + 2, x + w // 2 + 12, y + h - 2],
-                fill=(222, 200, 150))
-    for sy in (y + 8, y + h - 14):
-        for k in range(3):
-            d.line([x + w // 2 - 8 + k * 8, sy,
-                    x + w // 2 - 8 + k * 8, sy + 6], fill=(240, 230, 200),
-                   width=2)
-    d.rectangle([x + 16, y + 10, x + 30, y + 30], fill=(222, 190, 130),
-                outline=(120, 90, 40), width=1)
-    d.ellipse([x + w - 30, y + h - 22, x + w - 18, y + h - 10],
-              fill=(180, 30, 30))
-
-
-ART = {
-    "chip": art_chip, "ship": art_ship, "skyline": art_skyline,
-    "blast": art_blast, "tanker": art_tanker, "satellite": art_satellite,
-    "rocket": art_rocket, "bars": art_bars, "mountains": art_mountains,
-    "factory": art_factory, "scales": art_scales, "columns": art_columns,
-    "cricket": art_cricket,
-}
-
-# ---------------------------------------------------------------- world map
-
-NORTH_AMERICA = [(-168, 66), (-165, 60), (-158, 58), (-152, 60), (-140, 60),
-    (-135, 58), (-130, 54), (-125, 49), (-124, 42), (-120, 34), (-114, 29),
-    (-110, 24), (-105, 20), (-97, 16), (-94, 17), (-90, 14), (-86, 12),
-    (-83, 9), (-80, 8), (-79, 9), (-77, 7), (-81, 25), (-80, 32), (-76, 35),
-    (-74, 40), (-70, 42), (-68, 45), (-65, 44), (-60, 47), (-55, 47),
-    (-60, 52), (-65, 60), (-68, 58), (-78, 62), (-85, 66), (-92, 66),
-    (-95, 69), (-110, 68), (-125, 70), (-140, 70), (-155, 71), (-165, 68)]
-GREENLAND = [(-58, 64), (-52, 60), (-44, 60), (-40, 64), (-32, 68),
-    (-22, 70), (-20, 74), (-25, 78), (-35, 80), (-45, 78), (-55, 76),
-    (-58, 70)]
-SOUTH_AMERICA = [(-80, 9), (-77, 4), (-80, -3), (-81, -6), (-77, -12),
-    (-72, -18), (-70, -23), (-70, -30), (-72, -37), (-73, -44), (-74, -50),
-    (-70, -54), (-66, -55), (-68, -50), (-65, -45), (-62, -41), (-58, -35),
-    (-52, -32), (-48, -28), (-41, -23), (-39, -17), (-35, -9), (-35, -6),
-    (-40, -3), (-44, -2), (-50, 0), (-53, 4), (-58, 6), (-62, 9),
-    (-68, 11), (-72, 12), (-77, 8)]
-AFRICA = [(-17, 15), (-16, 20), (-15, 27), (-10, 31), (-6, 34), (0, 36),
-    (10, 37), (11, 34), (19, 32), (25, 32), (30, 31), (32, 31), (34, 28),
-    (37, 22), (39, 18), (43, 12), (48, 11), (51, 10), (46, 5), (42, 0),
-    (40, -5), (40, -10), (37, -15), (35, -20), (33, -26), (28, -33),
-    (20, -35), (17, -32), (15, -27), (13, -18), (12, -12), (13, -6),
-    (9, -1), (9, 4), (-8, 5), (-13, 8), (-17, 12)]
-EURASIA = [(-10, 36), (-9, 38), (-9, 43), (-2, 44), (-1, 46), (-4, 48),
-    (0, 50), (2, 51), (5, 53), (8, 55), (8, 57), (10, 59), (5, 60),
-    (5, 62), (10, 64), (13, 66), (18, 69), (25, 71), (30, 70), (35, 68),
-    (40, 68), (45, 68), (50, 69), (55, 69), (60, 69), (65, 70), (70, 72),
-    (75, 73), (80, 73), (85, 74), (90, 75), (95, 76), (100, 77),
-    (105, 77), (110, 74), (115, 73), (120, 73), (125, 72), (130, 72),
-    (135, 71), (140, 72), (145, 72), (150, 70), (155, 69), (160, 69),
-    (165, 66), (170, 66), (178, 65), (178, 62), (170, 60), (162, 60),
-    (158, 53), (156, 51), (150, 59), (142, 59), (140, 53), (138, 46),
-    (135, 43), (130, 42), (127, 40), (126, 38), (122, 38), (120, 32),
-    (118, 25), (110, 20), (108, 18), (105, 10), (103, 8), (100, 7),
-    (98, 10), (95, 16), (92, 21), (89, 22), (86, 20), (80, 15), (77, 8),
-    (75, 12), (73, 16), (70, 20), (66, 25), (62, 25), (58, 26), (56, 27),
-    (52, 28), (50, 29), (48, 30), (50, 26), (54, 24), (57, 22), (59, 22),
-    (55, 17), (52, 15), (48, 14), (44, 13), (43, 12), (40, 15), (38, 18),
-    (35, 20), (34, 22), (32, 25), (30, 28), (28, 30), (25, 31), (22, 32),
-    (19, 31), (15, 32), (11, 33), (10, 37), (8, 38), (3, 37), (0, 36),
-    (-2, 36), (-6, 36), (-9, 37)]
-AUSTRALIA = [(114, -22), (114, -30), (115, -34), (118, -35), (124, -33),
-    (129, -32), (132, -32), (135, -35), (138, -35), (140, -38),
-    (145, -38), (150, -37), (153, -32), (153, -27), (150, -23),
-    (146, -19), (142, -15), (142, -11), (137, -12), (135, -15),
-    (132, -12), (130, -13), (126, -14), (122, -17), (118, -20)]
-SUMATRA = [(95, 5), (100, 0), (104, -3), (106, -6), (101, -5), (97, 2)]
-BORNEO = [(109, 1), (113, 4), (117, 6), (119, 1), (116, -3), (111, -3),
-    (109, 0)]
-NEWGUINEA = [(131, -1), (136, -2), (141, -3), (146, -6), (147, -9),
-    (143, -8), (138, -8), (133, -4)]
-JAVA = [(105, -6), (110, -7), (114, -8), (114, -9), (108, -8)]
-BRITAIN = [(-5, 50), (-3, 53), (-5, 56), (-3, 58), (-1, 57), (0, 53),
-    (1, 51), (-2, 50)]
-JAPAN = [(130, 31), (132, 33), (134, 34), (137, 35), (139, 37), (141, 39),
-    (141, 41), (143, 42), (145, 44), (142, 45), (140, 42), (139, 38),
-    (137, 36), (133, 35), (130, 33)]
-CONTINENTS = [NORTH_AMERICA, GREENLAND, SOUTH_AMERICA, AFRICA, EURASIA,
-              AUSTRALIA, SUMATRA, BORNEO, NEWGUINEA, JAVA, BRITAIN, JAPAN]
-
-
-def draw_map(d, x, y, w, h, dots):
-    d.rectangle([x, y, x + w, y + h], fill=OCEAN)
-    d.rectangle([x, y, x + w, y + h], outline=LINE, width=1)
-    for lon in range(-150, 181, 30):
-        gx = x + int((lon + 180) / 360.0 * w)
-        d.line([gx, y, gx, y + h], fill=(160, 190, 205), width=1)
-    for lat in (-30, 0, 30, 60):
-        gy = y + int((84 - lat) / 144.0 * h)
-        d.line([x, gy, x + w, gy], fill=(160, 190, 205), width=1)
-
-    def px(lon, lat):
-        return (x + int((lon + 180) / 360.0 * w),
-                y + int((84 - lat) / 144.0 * h))
-
-    for poly in CONTINENTS:
-        d.polygon([px(lon, lat) for lon, lat in poly], fill=LAND,
-                  outline=(180, 165, 120))
-    num_font = _font(SANS_B, 9)
-    for dot in dots:
-        cx, cy = px(dot["lon"], dot["lat"])
-        dx, dy = dot.get("dx", 0), dot.get("dy", 0)
-        if dx or dy:
-            d.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], fill=RED,
-                      outline=WHITE, width=1)
-            lx, ly = cx + dx, cy + dy
-            d.line([cx, cy, lx, ly], fill=GRAY, width=1)
-            d.rectangle([lx - 8, ly - 7, lx + 8, ly + 7], fill=WHITE,
-                        outline=RED, width=1)
-            label = str(dot["n"])
-            d.text((lx - d.textlength(label, font=num_font) / 2, ly - 5),
-                   label, font=num_font, fill=RED)
-        else:
-            d.ellipse([cx - 6, cy - 6, cx + 6, cy + 6], fill=RED,
-                      outline=WHITE, width=1)
-            label = str(dot["n"])
-            d.text((cx - d.textlength(label, font=num_font) / 2, cy - 5),
-                   label, font=num_font, fill=WHITE)
-
-
-# ---------------------------------------------------------------- page
-
-def render(stories, out_path):
-    img = Image.new("RGB", (W, H), PAPER)
-    d = ImageDraw.Draw(img)
-
-    d.rectangle([0, 0, W, 4], fill=RED)
-
-    # masthead
-    f_mast = _font(SANS_B, 19)
-    d.text((24, 10), stories["title"], font=f_mast, fill=RED)
-    f_note = _font(SANS_B, 12)
-    note = stories["masthead_note"]
-    d.text((1000 - d.textlength(note, font=f_note), 14), note, font=f_note,
-           fill=INK)
-    d.line([24, 36, 1000, 36], fill=INK, width=2)
-
-    # date headline
-    f_date = _font(SERIF_B, 62)
-    date = stories["date"]
-    d.text(((W - d.textlength(date, font=f_date)) / 2, 40), date,
-           font=f_date, fill=INK)
-    f_sub = _font(SERIF_I, 17)
-    sub = stories["subhead"]
-    d.text(((W - d.textlength(sub, font=f_sub)) / 2, 108), sub, font=f_sub,
-           fill=DARKRED)
-    d.line([24, 132, 1000, 132], fill=LINE, width=1)
-
-    # numbers strip
-    nums = stories["numbers"]
-    cell = 976 / len(nums)
-    f_num = _font(SERIF_B, 28)
-    f_lab = _font(SANS, 9)
-    for i, item in enumerate(nums):
-        cx = 24 + cell * i
-        v, lab = item["v"], item["l"]
-        d.text((cx + (cell - d.textlength(v, font=f_num)) / 2, 138), v,
-               font=f_num, fill=RED)
-        d.text((cx + (cell - d.textlength(lab, font=f_lab)) / 2, 168), lab,
-               font=f_lab, fill=GRAY)
-        if i:
-            d.line([cx, 140, cx, 178], fill=LINE, width=1)
-    d.line([24, 182, 1000, 182], fill=LINE, width=1)
-
-    # region bar
-    total = sum(c for _, c in stories["regions"])
-    rx = 24
-    f_reg = _font(SANS_B, 10)
-    for name, count in stories["regions"]:
-        seg = 976 * count / total
-        d.rectangle([rx, 186, rx + seg, 206],
-                    fill=REGION_FILL.get(name, GRAY))
-        label = "%s %d" % (name, count)
-        d.text((rx + (seg - d.textlength(label, font=f_reg)) / 2, 191),
-               label, font=f_reg, fill=WHITE)
-        rx += seg
-
-    # features
-    fx = [24, 353, 682]
-    fw = 317
-    for i, feat in enumerate(stories["features"]):
-        x = fx[i]
-        y = 210
-        d.rectangle([x, y, x + fw, y + 28], fill=RED)
-        f_ban = _font(SANS_B, 16)
-        d.text((x + 10, y + 6), feat["banner"], font=f_ban, fill=WHITE)
-        f_chip = _font(SANS, 11)
-        chip = feat["chip"]
-        cw = d.textlength(chip, font=f_chip) + 18
-        cx0 = x + (fw - cw) / 2
-        d.rounded_rectangle([cx0, y + 32, cx0 + cw, y + 52], radius=9,
-                            fill=WHITE, outline=LINE, width=1)
-        d.text((cx0 + 9, y + 37), chip, font=f_chip, fill=INK)
-        ART[feat["art"]](d, x, y + 56, fw, 76)
-        ky = y + 136
-        f_kick = _font(SANS_B, 10)
-        d.text((x, ky), "%d · %s" % (feat["n"], feat["kicker"]), font=f_kick,
-               fill=RED)
-        tag_pill(d, x + fw, ky - 1, feat["tag"])
-        f_head, lines = fit_lines(d, feat["headline"], SERIF_B, 23, 19,
-                                  fw, 2)
-        ly = ky + 15
-        for line in lines:
-            d.text((x, ly), line, font=f_head, fill=INK)
-            ly += 25
-        f_deck = _font(SANS, 12)
-        dlines = wrap(d, feat["deck"], f_deck, fw)[:2]
-        ly = ky + 15 + 50
-        for line in dlines:
-            d.text((x, ly), line, font=f_deck, fill=INK)
-            ly += 14
-        f_src = _font(SANS_I, 10)
-        d.text((x, ky + 15 + 50 + 28), feat["source"], font=f_src,
-               fill=GRAY)
-
-    # the day in ten
-    d.line([24, 452, 1000, 452], fill=INK, width=2)
-    f_sec = _font(SANS_B, 13)
-    d.text((24, 456), "THE DAY IN TEN — THE STORIES THAT MOVED THE WORLD",
-           font=f_sec, fill=INK)
-
-    # medium grid
-    for i, cell in enumerate(stories["medium"]):
-        col, row = i % 5, i // 5
-        x = 24 + col * 197
-        y = 476 + row * 136
-        w = 189
-        d.rectangle([x, y, x + w, y + 20], fill=RED)
-        f_ban = _font(SANS_B, 12)
-        d.text((x + 6, y + 4), cell["banner"], font=f_ban, fill=WHITE)
-        ART[cell["art"]](d, x, y + 20, w, 34)
-        ky = y + 56
-        f_kick = _font(SANS_B, 9)
-        d.text((x, ky), "%d · %s" % (cell["n"], cell["kicker"]),
-               font=f_kick, fill=RED)
-        tag_pill(d, x + w, ky - 1, cell["tag"])
-        f_head, lines = fit_lines(d, cell["headline"], SERIF_B, 15, 12,
-                                  w, 2)
-        ly = ky + 13
-        for line in lines:
-            d.text((x, ly), line, font=f_head, fill=INK)
-            ly += 17
-        f_deck = _font(SANS, 10)
-        dlines = wrap(d, cell["deck"], f_deck, w)[:2]
-        ly = ky + 13 + 34
-        for line in dlines:
-            d.text((x, ly), line, font=f_deck, fill=INK)
-            ly += 12
-        f_src = _font(SANS_I, 9)
-        d.text((x, ky + 13 + 34 + 24), cell["source"], font=f_src,
-               fill=GRAY)
-
-    # map + also headers
-    d.line([24, 748, 1000, 748], fill=INK, width=2)
-    d.text((24, 752), "WHERE IT HAPPENED", font=f_sec, fill=INK)
-    d.text((440, 752), "ALSO ON TUESDAY — 20 MORE STORIES", font=f_sec,
-           fill=INK)
-    draw_map(d, 24, 770, 400, 126, stories["map_dots"])
-    f_cap = _font(SANS_I, 9)
-    d.text((24, 900), "Each number is the story with that number on this "
-           "page; 9 and 12 sit beside their dots.", font=f_cap, fill=GRAY)
-
-    # also list
-    f_also = _font(SANS, 10)
-    f_also_b = _font(SANS_B, 10)
-    for i, line in enumerate(stories["also"]):
-        col, row = i % 2, i // 2
-        ax = 440 + col * 284
-        ay = 770 + row * 13
-        num, rest = line.split(" ", 1)
-        d.text((ax, ay), num, font=f_also_b, fill=RED)
-        d.text((ax + d.textlength(num + " ", font=f_also_b), ay), rest,
-               font=f_also, fill=INK)
-
-    # date check
-    d.rectangle([24, 918, 1000, 972], outline=RED, width=2, fill=CREAMBOX)
-    f_dc = _font(SANS, 11)
-    f_dc_b = _font(SANS_B, 11)
-    sentences = stories["datecheck"].split(". ")
-    d.text((32, 924), "DATE CHECK", font=f_dc_b, fill=RED)
-    lx = 32 + d.textlength("DATE CHECK  ", font=f_dc_b)
-    ly = 924
-    for j, s in enumerate(sentences):
-        s = s if s.endswith(".") else s + "."
-        if j == 0:
-            d.text((lx, ly), s, font=f_dc, fill=INK)
-        else:
-            d.text((32, ly), s, font=f_dc, fill=INK)
-        ly += 14
-    # if the first sentence wrapped, it would collide; sentences are short
-    # enough to fit one line each at 11px across 936px.
-
-    # footer
-    f_foot = _font(SANS_B, 9)
-    d.text((24, 978), stories["how_checked"], font=f_foot, fill=INK)
-    f_note2 = _font(SANS_I, 9)
-    d.text((24, 990), stories["footer_note"], font=f_note2, fill=GRAY)
-
-    # bottom bar
-    d.rectangle([0, 1002, W, H], fill=DARKNAVY)
-    f_bot = _font(SANS_B, 12)
-    d.text((24, 1008), stories["title"], font=f_bot, fill=WHITE)
-    tail = "TUESDAY 24 NOVEMBER 2026 · ONE PAGE"
-    d.text((1000 - d.textlength(tail, font=f_bot), 1008), tail,
-           font=f_bot, fill=WHITE)
-
-    img.save(out_path, "PNG")
-    return out_path
-
-
-def main():
-    here = os.path.dirname(os.path.abspath(__file__))
-    with open(os.path.join(here, "stories.json"), encoding="utf-8") as f:
-        stories = json.load(f)
-    out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(here,
-                                                             "entry.png")
-    render(stories, out)
-    print("wrote", out)
-
-
-if __name__ == "__main__":
-    main()
+def write_png(path, canvas):
+    w, h = canvas.w, canvas.h
+    raw = bytearray()
+    for y in range(h):
+        raw.append(0)
+        raw += canvas.px[y * w * 3:(y + 1) * w * 3]
+    ihdr = struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)
+    data = b'\x89PNG\r\n\x1a\n'
+    data += _chunk(b'IHDR', ihdr)
+    comp = zlib.compress(bytes(raw), 6)
+    data += _chunk(b'IDAT', comp)
+    data += _chunk(b'IEND', b'')
+    with open(path, 'wb') as f:
+        f.write(data)
